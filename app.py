@@ -16,6 +16,7 @@ Config (all env):
 import os
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
@@ -61,15 +62,22 @@ async def healthz() -> dict:
 
 @app.post("/")
 @app.post("/v1/chat/completions")
-async def chat(req: ChatRequest) -> dict:
-    if req.stream:
-        raise HTTPException(status_code=400, detail="streaming is not supported")
+async def chat(req: ChatRequest):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + [
         {"role": t.role, "content": t.content} for t in req.messages if t.role != "system"
     ]
-    resp = await client().chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        **({"user": req.user} if req.user else {}),
-    )
+    kwargs = {"model": MODEL, "messages": messages,
+              **({"user": req.user} if req.user else {})}
+    if req.stream:
+        # relay OpenAI's own SSE chunks — the platform gateway passes them
+        # through to the caller untouched
+        upstream = await client().chat.completions.create(stream=True, **kwargs)
+
+        async def sse():
+            async for chunk in upstream:
+                yield f"data: {chunk.model_dump_json()}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(sse(), media_type="text/event-stream")
+    resp = await client().chat.completions.create(**kwargs)
     return resp.model_dump()
