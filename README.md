@@ -75,3 +75,15 @@ When the agent is deployed BY the platform, set these in the runtime env
 (key via an `environment_variable` secret) and use the in-cluster base URL
 `http://control-plane.control-plane.svc.cluster.local:8081/llm/v1` to skip
 the public hop.
+
+
+## Local tools
+
+The agent carries three local tools — `calculator` (AST-walked arithmetic,
+never eval), `current_time`, and `string_stats` — behind the standard
+function-calling loop (max 4 rounds). Ask "what is 23*47?" or "what time is
+it?" and the model calls the tool, gets the result fed back, and answers.
+
+Routed through the platform's LLM gateway, every round-trip is its own
+traced request: Request traces shows call 1 (the model asking for the tool)
+and call 2 (tool results in, final answer out), tokens and cost per hop.
