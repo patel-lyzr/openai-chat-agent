@@ -6,11 +6,18 @@ conversation to OpenAI (with our own system prompt and model choice) and
 return the OpenAI-shaped response as-is.
 
 Config (all env):
-    OPENAI_API_KEY  — required; on the platform, attach it as an
-                      environment_variable secret or a secret:// env ref
-    OPENAI_MODEL    — default gpt-4o-mini
-    SYSTEM_PROMPT   — persona; default below
-    PORT            — default 8000 (the platform's runtime envelope sets it)
+    OPENAI_API_KEY   — required. Direct mode: a real OpenAI key. Platform
+                       mode: a controlplane credential (cpk_… service-account
+                       key) — attach it as an environment_variable secret.
+    OPENAI_BASE_URL  — optional. Point it at the platform's LLM gateway
+                       (https://<console-host>/llm/v1) and every completion
+                       routes through controlplane -> Rekori: metered,
+                       budgeted, provider keys stay in the platform vault.
+                       Unset = talk to api.openai.com directly.
+    OPENAI_MODEL     — default gpt-4o-mini. In platform mode use the
+                       gateway's namespaced form, e.g. openai-main/gpt-4o-mini.
+    SYSTEM_PROMPT    — persona; default below
+    PORT             — default 8000 (the platform's runtime envelope sets it)
 """
 
 import os
@@ -36,7 +43,8 @@ def client() -> AsyncOpenAI:
     if _client is None:
         if not os.getenv("OPENAI_API_KEY"):
             raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured")
-        _client = AsyncOpenAI()
+        # base_url unset -> api.openai.com; set -> the platform's LLM gateway
+        _client = AsyncOpenAI(base_url=os.getenv("OPENAI_BASE_URL") or None)
     return _client
 
 
@@ -57,7 +65,8 @@ class ChatRequest(BaseModel):
 @app.get("/healthz")
 async def healthz() -> dict:
     # liveness only — no upstream call, so probes never burn tokens
-    return {"ok": True, "model": MODEL}
+    return {"ok": True, "model": MODEL,
+            "upstream": os.getenv("OPENAI_BASE_URL") or "api.openai.com"}
 
 
 @app.post("/")

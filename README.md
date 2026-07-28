@@ -57,3 +57,21 @@ never appears in this repo, the registry, or the deployment spec.
 
 > GHCR note: make the package public (or add a pull secret on the
 > cluster) so Kubernetes can pull the image.
+
+
+## Routing through the platform's LLM gateway
+
+Instead of holding a raw OpenAI key, point the agent at the control plane's
+LLM gateway — completions are then metered, budgeted, and traced by the
+platform, and the real provider key never leaves its vault:
+
+| Env | Value |
+|---|---|
+| `OPENAI_BASE_URL` | `https://controlplane.test.studio.lyzr.ai/llm/v1` |
+| `OPENAI_API_KEY` | a `cpk_…` service-account key (Settings → Service accounts) |
+| `OPENAI_MODEL` | `openai-main/gpt-4o-mini` (the gateway's `provider/model` form) |
+
+When the agent is deployed BY the platform, set these in the runtime env
+(key via an `environment_variable` secret) and use the in-cluster base URL
+`http://control-plane.control-plane.svc.cluster.local:8081/llm/v1` to skip
+the public hop.
