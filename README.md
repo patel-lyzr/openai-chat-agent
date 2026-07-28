@@ -87,3 +87,5 @@ it?" and the model calls the tool, gets the result fed back, and answers.
 Routed through the platform's LLM gateway, every round-trip is its own
 traced request: Request traces shows call 1 (the model asking for the tool)
 and call 2 (tool results in, final answer out), tokens and cost per hop.
+
+CI → platform releases are ARMED: every push to main deploys to dev via the CD hook.
