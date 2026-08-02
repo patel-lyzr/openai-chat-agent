@@ -26,7 +26,7 @@ import operator
 import os
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
@@ -110,11 +110,22 @@ TOOLS = [
 MAX_TOOL_ROUNDS = 4
 
 
-async def run_tool_loop(messages: list[dict], user: str | None):
+async def run_tool_loop(messages: list[dict], user: str | None,
+                        trace_headers: dict[str, str] | None = None):
     """The standard function-calling loop: let the model request local tools,
-    execute them here, feed results back, until it answers in prose."""
+    execute them here, feed results back, until it answers in prose.
+
+    `trace_headers` carries the platform's W3C traceparent through to the LLM
+    gateway. Forwarding it is the entire contract: with it, these model calls
+    nest under the agent invocation and the platform's trace list can show the
+    tokens and cost of the whole turn on one row. Without it they land as a
+    separate trace and the agent's own row looks empty.
+
+    No SDK and no instrumentation library — one header, passed along.
+    """
     kwargs = {"model": MODEL, "tools": TOOLS,
-              **({"user": user} if user else {})}
+              **({"user": user} if user else {}),
+              **({"extra_headers": trace_headers} if trace_headers else {})}
     resp = None
     for _ in range(MAX_TOOL_ROUNDS):
         resp = await client().chat.completions.create(messages=messages, **kwargs)
@@ -169,7 +180,14 @@ async def healthz() -> dict:
 
 @app.post("/")
 @app.post("/v1/chat/completions")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
+    # Pass the caller's trace context straight through. Anything unrelated in
+    # the headers stays out of it — this forwards exactly the two W3C keys.
+    trace_headers = {
+        k: request.headers[k]
+        for k in ("traceparent", "tracestate")
+        if k in request.headers
+    }
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + [
         {"role": t.role, "content": t.content} for t in req.messages if t.role != "system"
     ]
@@ -177,7 +195,7 @@ async def chat(req: ChatRequest):
         # Tools + streaming don't compose simply: the loop must finish before
         # the final text exists. Run the loop, then emit the answer as SSE so
         # streaming clients (the platform playground included) keep working.
-        resp = await run_tool_loop(messages, req.user)
+        resp = await run_tool_loop(messages, req.user, trace_headers)
 
         async def sse():
             chunk = {"id": resp.id, "object": "chat.completion.chunk",
@@ -192,5 +210,5 @@ async def chat(req: ChatRequest):
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(sse(), media_type="text/event-stream")
-    resp = await run_tool_loop(messages, req.user)
+    resp = await run_tool_loop(messages, req.user, trace_headers)
     return resp.model_dump()
