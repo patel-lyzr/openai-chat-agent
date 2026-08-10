@@ -1,0 +1,65 @@
+# Desired state for the Argo CD POC.
+#
+# This mirrors how PepGenX runs it: the configs repo holds the workload
+# definition and the image tag, and NOTHING ELSE. Credentials arrive as a
+# Secret created out of band (Key Vault / secret provider class on their side),
+# referenced here only by name, so this file is safe to keep in Git.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agents-poc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openai-chat-agent
+  namespace: agents-poc
+  labels:
+    app: openai-chat-agent
+    platform/agent: openai-chat-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openai-chat-agent
+  template:
+    metadata:
+      labels:
+        app: openai-chat-agent
+    spec:
+      containers:
+        - name: agent
+          image: ghcr.io/patel-lyzr/openai-chat-agent:1ca78a7bbe8c3316f2c034b7f852dfd2851f5f8b
+          ports:
+            - containerPort: 8000
+          env:
+            - name: OPENAI_MODEL
+              value: gpt-4o-mini
+          envFrom:
+            - secretRef:
+                name: agent-env
+                optional: true
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openai-chat-agent
+  namespace: agents-poc
+spec:
+  selector:
+    app: openai-chat-agent
+  ports:
+    - port: 80
+      targetPort: 8000
