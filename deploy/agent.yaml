@@ -34,7 +34,7 @@ spec:
             - containerPort: 8000
           env:
             - name: OPENAI_MODEL
-              value: gpt-4o-mini
+              value: gpt-4o-mini  # poc: trigger a redeploy
           envFrom:
             - secretRef:
                 name: agent-env
