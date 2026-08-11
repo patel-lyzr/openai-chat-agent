@@ -29,7 +29,7 @@ spec:
     spec:
       containers:
         - name: agent
-          image: ghcr.io/patel-lyzr/openai-chat-agent:1ca78a7bbe8c3316f2c034b7f852dfd2851f5f8b
+          image: ghcr.io/patel-lyzr/openai-chat-agent:3623b128e05fb323dc9aaa8ebee095fe68702966
           ports:
             - containerPort: 8000
           env:
