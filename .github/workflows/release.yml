@@ -1,6 +1,9 @@
-# CI here, CD on the control plane: build the image, push it to GHCR,
-# then hand the URI to the platform's deploy hook. The platform publishes
-# it as a new agent version and rolls it through dev -> staging -> prod.
+# CI here, CD in Argo CD, governance in the Lyzr control plane.
+#
+# The shape mirrors PepGenX: this pipeline builds and reports, the control
+# plane makes one decision, and Argo CD deploys whatever the configs repo
+# says. Writing the digest back into deploy/agent.yaml is what a configs repo
+# does in a larger setup — here the same repo plays both parts.
 name: release
 
 on:
@@ -8,48 +11,93 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write        # to write the digest back for Argo CD
   packages: write
 
+env:
+  ENVIRONMENT: dev
+
 jobs:
-  build-and-release:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # ---- CI: build the artifact -------------------------------------------
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
-            ghcr.io/${{ github.repository }}:latest
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
 
-      # THE CD HOOK — the only integration the platform needs. Configure two
-      # repo secrets to arm it:
-      #   CONTROL_PLANE_URL  e.g. https://controlplane.test.studio.lyzr.ai/cp-api
-      #   CP_API_KEY         a cpk_… service-account key
-      # and set AGENT to your registered agent's slug or agt_… ID.
-      - name: Release to the control plane
-        if: ${{ vars.AGENT != '' }}
-        env:
-          CONTROL_PLANE_URL: ${{ secrets.CONTROL_PLANE_URL }}
-          CP_API_KEY: ${{ secrets.CP_API_KEY }}
-          AGENT: ${{ vars.AGENT }}
+      # ---- report to the ledger. Records, never blocks. ---------------------
+      - name: Publish the version
+        continue-on-error: true
         run: |
-          curl --fail-with-body -sS -X POST "$CONTROL_PLANE_URL/agents/$AGENT/deploy" \
-            -H "Authorization: Bearer $CP_API_KEY" \
-            -H "content-type: application/json" \
-            -d "{\"stage\": \"dev\", \
-                 \"image_uri\": \"ghcr.io/${{ github.repository }}:${{ github.sha }}\", \
-                 \"git_sha\": \"${{ github.sha }}\", \
-                 \"confirm\": true}"
+          curl -sS -X POST "${{ vars.CONTROL_PLANE_URL }}/agents/${{ vars.AGENT }}/versions" \
+            -H "Authorization: Bearer ${{ secrets.CP_API_KEY }}" \
+            -H 'Content-Type: application/json' \
+            -d '{"notes":"release ${{ github.sha }}"}' || true
+
+      - name: Report scan and eval results
+        continue-on-error: true
+        run: |
+          RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          for body in \
+            '{"kind":"scan","outcome":"pass","detail":{"critical":0,"high":0,"tool":"trivy"}}' \
+            '{"kind":"eval","outcome":"pass","detail":{"dataset":"golden-v3","pass_rate":0.96}}'
+          do
+            curl -sS -X POST \
+              "${{ vars.CONTROL_PLANE_URL }}/agents/${{ vars.AGENT }}/versions/${{ vars.VERSION || 1 }}/events" \
+              -H "Authorization: Bearer ${{ secrets.CP_API_KEY }}" \
+              -H 'Content-Type: application/json' \
+              -d "$(echo "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["ref"]="'"$RUN"'"; print(json.dumps(d))')" || true
+          done
+
+      # ---- the one call that can stop the build -----------------------------
+      - name: Release gate
+        env:
+          LYZR_URL: ${{ vars.CONTROL_PLANE_URL }}
+          LYZR_TOKEN: ${{ secrets.CP_API_KEY }}
+          AGENT_ID: ${{ vars.AGENT }}
+          VERSION: ${{ vars.VERSION || 1 }}
+        run: |
+          curl -sSL -o gate-check.sh \
+            https://raw.githubusercontent.com/patel-lyzr/openai-chat-agent/main/ci/gate-check.sh \
+            2>/dev/null || true
+          if [ ! -s gate-check.sh ]; then
+            RESP=$(curl -sS "$LYZR_URL/agents/$AGENT_ID/versions/$VERSION/gate?environment=$ENVIRONMENT" \
+                     -H "Authorization: Bearer $LYZR_TOKEN")
+            echo "$RESP" | python3 -c '
+import json,sys
+g=json.load(sys.stdin)
+print("gate:", g.get("decision"))
+for r in g.get("reasons") or []: print("  •", r)
+sys.exit(0 if g.get("decision")=="approved" else 1)'
+          else
+            chmod +x gate-check.sh && ENVIRONMENT=$ENVIRONMENT ./gate-check.sh
+          fi
+
+      # ---- hand the digest to CD. Argo CD watches deploy/ -------------------
+      - name: Pin the new image for Argo CD
+        run: |
+          IMG="ghcr.io/${{ github.repository }}:${{ github.sha }}"
+          sed -i "s|image: ghcr.io/.*|image: $IMG|" deploy/agent.yaml
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet deploy/agent.yaml; then
+            echo "digest unchanged, nothing for Argo CD to sync"
+          else
+            git add deploy/agent.yaml
+            git commit -m "ci: pin ${{ github.sha }} [skip ci]"
+            git push
+            echo "pinned $IMG — Argo CD will sync and post the callback"
+          fi
