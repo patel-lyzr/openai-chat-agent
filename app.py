@@ -39,6 +39,7 @@ SYSTEM_PROMPT = os.getenv(
 )
 
 app = FastAPI(title="openai-chat-agent")
+DEMO_BUILD = "gate-demo-1"
 _client: AsyncOpenAI | None = None
 
 # ---------------------------------------------------------------------------
