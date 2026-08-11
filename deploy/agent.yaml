@@ -34,7 +34,7 @@ spec:
             - containerPort: 8000
           env:
             - name: OPENAI_MODEL
-              value: gpt-4o-mini  # poc: closing the callback loop
+              value: gpt-4o-mini  # poc: end-to-end, argo posts this
           envFrom:
             - secretRef:
                 name: agent-env
