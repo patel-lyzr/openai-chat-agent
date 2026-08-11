@@ -1,9 +1,12 @@
 # CI here, CD in Argo CD, governance in the Lyzr control plane.
 #
-# The shape mirrors PepGenX: this pipeline builds and reports, the control
-# plane makes one decision, and Argo CD deploys whatever the configs repo
-# says. Writing the digest back into deploy/agent.yaml is what a configs repo
-# does in a larger setup — here the same repo plays both parts.
+# This pipeline builds and reports; the control plane makes one decision; Argo
+# CD deploys whatever deploy/ says. Writing the digest back into
+# deploy/agent.yaml is the handover — in a larger setup that is a separate
+# configs repo, here one repo plays both parts.
+#
+# Logic lives in ci/*.sh rather than inline, so a shell quoting mistake is a
+# script bug and not a workflow that refuses to start.
 name: release
 
 on:
@@ -11,11 +14,14 @@ on:
     branches: [main]
 
 permissions:
-  contents: write        # to write the digest back for Argo CD
+  contents: write
   packages: write
 
 env:
   ENVIRONMENT: dev
+  LYZR_URL: ${{ vars.CONTROL_PLANE_URL }}
+  AGENT_ID: ${{ vars.AGENT }}
+  VERSION: ${{ vars.VERSION }}
 
 jobs:
   release:
@@ -23,81 +29,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---- CI: build the artifact -------------------------------------------
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: build
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
-          labels: org.opencontainers.image.revision=${{ github.sha }}
 
-      # ---- report to the ledger. Records, never blocks. ---------------------
-      - name: Publish the version
+      - name: Report to the ledger
         continue-on-error: true
-        run: |
-          curl -sS -X POST "${{ vars.CONTROL_PLANE_URL }}/agents/${{ vars.AGENT }}/versions" \
-            -H "Authorization: Bearer ${{ secrets.CP_API_KEY }}" \
-            -H 'Content-Type: application/json' \
-            -d '{"notes":"release ${{ github.sha }}"}' || true
+        env:
+          LYZR_TOKEN: ${{ secrets.CP_API_KEY }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: ./ci/report.sh
 
-      - name: Report scan and eval results
-        continue-on-error: true
-        run: |
-          RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          for body in \
-            '{"kind":"scan","outcome":"pass","detail":{"critical":0,"high":0,"tool":"trivy"}}' \
-            '{"kind":"eval","outcome":"pass","detail":{"dataset":"golden-v3","pass_rate":0.96}}'
-          do
-            curl -sS -X POST \
-              "${{ vars.CONTROL_PLANE_URL }}/agents/${{ vars.AGENT }}/versions/${{ vars.VERSION || 1 }}/events" \
-              -H "Authorization: Bearer ${{ secrets.CP_API_KEY }}" \
-              -H 'Content-Type: application/json' \
-              -d "$(echo "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["ref"]="'"$RUN"'"; print(json.dumps(d))')" || true
-          done
-
-      # ---- the one call that can stop the build -----------------------------
       - name: Release gate
         env:
-          LYZR_URL: ${{ vars.CONTROL_PLANE_URL }}
           LYZR_TOKEN: ${{ secrets.CP_API_KEY }}
-          AGENT_ID: ${{ vars.AGENT }}
-          VERSION: ${{ vars.VERSION || 1 }}
-        run: |
-          curl -sSL -o gate-check.sh \
-            https://raw.githubusercontent.com/patel-lyzr/openai-chat-agent/main/ci/gate-check.sh \
-            2>/dev/null || true
-          if [ ! -s gate-check.sh ]; then
-            RESP=$(curl -sS "$LYZR_URL/agents/$AGENT_ID/versions/$VERSION/gate?environment=$ENVIRONMENT" \
-                     -H "Authorization: Bearer $LYZR_TOKEN")
-            echo "$RESP" | python3 -c '
-import json,sys
-g=json.load(sys.stdin)
-print("gate:", g.get("decision"))
-for r in g.get("reasons") or []: print("  •", r)
-sys.exit(0 if g.get("decision")=="approved" else 1)'
-          else
-            chmod +x gate-check.sh && ENVIRONMENT=$ENVIRONMENT ./gate-check.sh
-          fi
+        run: ./ci/gate-check.sh
 
-      # ---- hand the digest to CD. Argo CD watches deploy/ -------------------
-      - name: Pin the new image for Argo CD
-        run: |
-          IMG="ghcr.io/${{ github.repository }}:${{ github.sha }}"
-          sed -i "s|image: ghcr.io/.*|image: $IMG|" deploy/agent.yaml
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet deploy/agent.yaml; then
-            echo "digest unchanged, nothing for Argo CD to sync"
-          else
-            git add deploy/agent.yaml
-            git commit -m "ci: pin ${{ github.sha }} [skip ci]"
-            git push
-            echo "pinned $IMG — Argo CD will sync and post the callback"
-          fi
+      - name: Pin the digest for Argo CD
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
+        run: ./ci/pin-image.sh
